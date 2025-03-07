@@ -25,6 +25,7 @@ using GraphQL.DI;
 using GraphQL.Authorization;
 using GraphQL.MicrosoftDI;
 using GraphQL.Resolvers;
+using SER.Graphql.Reflection.NetCore.Models;
 
 namespace SER.Graphql.Reflection.NetCore.Custom
 {
@@ -44,6 +45,71 @@ namespace SER.Graphql.Reflection.NetCore.Custom
            where TUser : class
            where TRole : class
             => AddConfigGraphQl<TContext, TUser, TRole, object>(services, options);
+
+        public static IServiceCollection AddBasicConfigGraphQl<TContext>(this IServiceCollection services, Action<ExecutionOptions> options)
+
+        where TContext : DbContext
+        {
+            services.AddHttpContextAccessor();
+
+            //services.AddSingleton<IDocumentExecuter, MyDocumentExecuter>();
+            services.AddSingleton<ITableNameLookup, TableNameLookup>();
+            services.AddSingleton<TableMetadata>();
+            services.AddSingleton<IDatabaseMetadata, DatabaseMetadata<TContext>>();
+
+            services.AddSingleton<GraphQLQuery<FakeUser, FakeRole, FakeUserRole>>();
+            services.AddScoped<IGraphRepository<Audit>, GenericGraphRepository<Audit, TContext, FakeUser, FakeRole, FakeUserRole>>();
+
+            services.AddScoped<FillDataExtensions>();
+            services.AddSingleton<ISchema, AppSchema<FakeUser, FakeRole, FakeUserRole>>();
+            services.AddSingleton<ISERFieldResolver<FakeUser, FakeRole, FakeUserRole>, MyFieldResolver<FakeUser, FakeRole, FakeUserRole>>();
+            services.AddSingleton<IFieldResolver, CUDResolver>();
+
+            services.AddLogging(builder => builder.AddConsole());
+
+            // v5
+            services.AddGraphQL(builder => builder
+                .ConfigureExecutionOptions(options)
+                .AddSystemTextJson()
+                .AddDataLoader() // Add required services for DataLoader support
+                .AddUserContextBuilder(ctx => new GraphQLUserContext(ctx.User))
+                .AddGraphTypes()
+            );
+
+
+            var config = new GraphQLConfiguration(services);
+            config.UseDbContext<TContext>();
+
+            // services.AddScoped<IGraphRepository<IdentityRoleClaim<string>>, BasicGenericGraphRepository<IdentityRoleClaim<string>, TContext>>();
+
+
+            services.Configure<SERGraphQlOptions>(options =>
+            {
+                options.UserType = typeof(FakeUser);
+                options.RoleType = typeof(FakeRole);
+                options.UserRoleType = typeof(FakeUserRole);
+            });
+
+            var assembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(x => x.GetName().Name == typeof(TContext).Assembly.GetName().Name);
+            // var assembly = Assembly.GetCallingAssembly();
+
+            foreach (var type in assembly.GetTypes()
+                .Where(x => !x.IsAbstract && typeof(IBaseModel).IsAssignableFrom(x)))
+            {
+                var interfaceType = typeof(IGraphRepository<>).MakeGenericType(new Type[] { type });
+                var inherateType = typeof(GenericGraphRepository<,,,,>).MakeGenericType(new Type[] { type, typeof(TContext), typeof(FakeUser), typeof(FakeRole), typeof(FakeUserRole) });
+                var serviceLifetime = Microsoft.Extensions.DependencyInjection.ServiceLifetime.Scoped;
+                Console.WriteLine($"Dependencia IGraphRepository registrada type {type.Name}");
+                services.TryAdd(new ServiceDescriptor(interfaceType, inherateType, serviceLifetime));
+
+                var interfaceHandleType = typeof(IHandleMsg<>).MakeGenericType(new Type[] { type });
+                var inherateHandleType = typeof(HandleMsg<>).MakeGenericType(new Type[] { type });
+                services.TryAdd(new ServiceDescriptor(interfaceHandleType, inherateHandleType, Microsoft.Extensions.DependencyInjection.ServiceLifetime.Singleton));
+            }
+
+
+            return services;
+        }
 
         public static IServiceCollection AddConfigGraphQl<TContext, TUser, TRole, TUserRole>(this IServiceCollection services, Action<ExecutionOptions> options)
 
