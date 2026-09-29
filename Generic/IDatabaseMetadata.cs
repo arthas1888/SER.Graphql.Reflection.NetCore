@@ -31,7 +31,15 @@ namespace SER.Graphql.Reflection.NetCore.Generic
         private readonly IConfiguration _config;
         private IEnumerable<TableMetadata> _tables;
         private readonly IOptionsMonitor<SERGraphQlOptions> _optionsDelegate;
-        private readonly IWebHostEnvironment _env;        
+        private readonly IWebHostEnvironment _env;
+        private HashSet<string> _excluded = new HashSet<string>();
+
+        // Inherited IdentityUser/IdentityRole members that must never be projected, even without an
+        // attribute (the framework declares them, so they cannot carry [GraphQLIgnore]).
+        private static readonly HashSet<string> IdentitySecretMembers = new HashSet<string>
+        {
+            "PasswordHash", "SecurityStamp", "ConcurrencyStamp"
+        };
 
         public DatabaseMetadata(
             ITableNameLookup tableNameLookup,
@@ -64,6 +72,9 @@ namespace SER.Graphql.Reflection.NetCore.Generic
         private IReadOnlyList<TableMetadata> FetchTableMetaData()
         {
             var metaTables = new List<TableMetadata>();
+
+            // Fail closed: a configured-but-missing/invalid excluded-types file throws here, at startup.
+            _excluded = ExcludedGraphTypes.Load(_optionsDelegate.CurrentValue.ExcludedTypesPath);
 
             string SqlConnectionStr = !string.IsNullOrEmpty(_optionsDelegate.CurrentValue.ConnectionString) ?
                 _optionsDelegate.CurrentValue.ConnectionString : !string.IsNullOrEmpty(_config.GetConnectionString("DefaultConnection")) ?
@@ -98,6 +109,9 @@ namespace SER.Graphql.Reflection.NetCore.Generic
                     // Console.WriteLine($"tabla evaluada Name {entityType.Name.Split(".").Last()} elementType {elementType}");
                 }
 
+                if (ExcludedGraphTypes.IsExcluded(elementType.Name, tableName))
+                    continue;
+
                 var namePk = entityType.FindPrimaryKey()?.Properties
                      .Select(x => x.Name).FirstOrDefault();
                 if (namePk == null) continue;
@@ -119,6 +133,9 @@ namespace SER.Graphql.Reflection.NetCore.Generic
             foreach (var entityType in jsonModelTypes)
             {
                 var tableName = entityType.Name;
+
+                if (ExcludedGraphTypes.IsExcluded(entityType.Name, tableName))
+                    continue;
 
                 metaTables.Add(new TableMetadata
                 {
@@ -172,6 +189,19 @@ namespace SER.Graphql.Reflection.NetCore.Generic
 
                     if (propertyType.GetCustomAttributes(true)
                            .Any(x => x.GetType() == typeof(NotMappedAttribute))) continue;
+
+                    // Never project a column marked [GraphQLIgnore], an inherited Identity secret, or a
+                    // navigation to an excluded type. Dropping it here removes it from the output field,
+                    // the input field, the filter arguments and introspection in one place.
+                    if (propertyType.GetCustomAttributes(true).Any(x => x is GraphQLIgnoreAttribute))
+                        continue;
+                    if (IdentitySecretMembers.Contains(propertyType.Name)
+                        && (typeof(Microsoft.AspNetCore.Identity.IdentityUser).IsAssignableFrom(type)
+                            || typeof(Microsoft.AspNetCore.Identity.IdentityRole).IsAssignableFrom(type)))
+                        continue;
+                    if (field != null && ExcludedGraphTypes.IsExcluded(field.Name, null))
+                        continue;
+
                     tableColumns.Add(new ColumnMetadata
                     {
                         ColumnName = propertyType.Name,

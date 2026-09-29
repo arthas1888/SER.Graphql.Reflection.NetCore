@@ -137,6 +137,8 @@ namespace SER.Graphql.Reflection.NetCore
             var services = scope.ServiceProvider;
             var dbContext = services.GetRequiredService<TContext>();
 
+            first = ClampTake(first);
+
             IQueryable<T> query = GetModel(dbContext);
 
             if (includeExpressions != null && includeExpressions.Count > 0)
@@ -255,7 +257,72 @@ namespace SER.Graphql.Reflection.NetCore
             };
         }
 
-        private IQueryable<T> FilterQueryByCustomFilter(IQueryable<T> query, out bool find, Type parentType = null, string columnName = "")
+        // Tenant scoping. A caller carrying a company_id claim (a merchant user) is confined to its own
+        // company, fail closed: shared reference types are allowed across tenants, the company row itself
+        // is scoped by its primary key, any other type is scoped by its resolvable company_id, and a
+        // tenant-scoped type with no resolvable company_id returns nothing rather than every company's
+        // rows. A caller with no company_id claim (backoffice / cross-tenant principal) keeps the legacy
+        // reflective behavior untouched.
+        private IQueryable<T> FilterQueryByCustomFilter(IQueryable<T> query, out bool find)
+        {
+            find = true;
+            var opts = _optionsDelegate.CurrentValue;
+            var companyId = GetCompanyIdUser();
+
+            if (string.IsNullOrEmpty(companyId))
+                return FilterByCompanyColumnLegacy(query, out find);
+
+            var t = typeof(T);
+
+            if (opts.GlobalSharedTypeNames != null && opts.GlobalSharedTypeNames.Contains(t.Name))
+                return query;
+
+            // The company row itself has no company_id column; its PK is the tenant key. Tiendana models
+            // name the PK "id", matching the rest of this library's id-based assumptions.
+            if (opts.TenantRootType == t)
+                return query.Where("id = @0", companyId);
+
+            var path = ResolveCompanyIdColumnPath(t, opts.NameCustomFilter);
+            if (path != null)
+                return query.Where($"{path} = @0", companyId);
+
+            return query.Where(_ => false);
+        }
+
+        /// <summary>
+        /// Returns the dynamic-LINQ path to the tenant column for <paramref name="type"/>: the
+        /// <paramref name="nameField"/> column itself, or "&lt;nav&gt;.&lt;column&gt;" one foreign-key hop
+        /// away (navs ordered by name descending, matching the legacy walk). Null when neither exists.
+        /// </summary>
+        private string ResolveCompanyIdColumnPath(Type type, string nameField)
+        {
+            static bool IsScalar(System.Reflection.PropertyInfo p)
+                => !p.GetCustomAttributes(true).Any(x => x is NotMappedAttribute)
+                   && !p.GetCustomAttributes(true).OfType<ColumnAttribute>().Any(a => a.TypeName == "geography" || a.TypeName == "jsonb")
+                   && !p.PropertyType.IsArray
+                   && !(typeof(ICollection).IsAssignableFrom(p.PropertyType));
+
+            foreach (var p in type.GetProperties())
+                if (IsScalar(p) && p.Name.ToSnakeCase() == nameField)
+                    return p.Name;
+
+            var navs = new SortedDictionary<string, Type>(StringComparer.Ordinal);
+            foreach (var p in type.GetProperties())
+            {
+                if (!p.GetCustomAttributes(true).OfType<ForeignKeyAttribute>().Any()) continue;
+                var child = Nullable.GetUnderlyingType(p.PropertyType) ?? p.PropertyType;
+                if (typeof(IBaseModel).IsAssignableFrom(child) || child == typeof(TUser) || child == typeof(TRole) || child == typeof(TUserRole))
+                    navs[p.Name] = child;
+            }
+            foreach (var nav in navs.Reverse())
+                foreach (var cp in nav.Value.GetProperties())
+                    if (cp.Name.ToSnakeCase() == nameField)
+                        return $"{nav.Key}.{cp.Name}";
+
+            return null;
+        }
+
+        private IQueryable<T> FilterByCompanyColumnLegacy(IQueryable<T> query, out bool find, Type parentType = null, string columnName = "")
         {
             string nameField = _optionsDelegate.CurrentValue.NameCustomFilter;
             find = false;
@@ -317,7 +384,7 @@ namespace SER.Graphql.Reflection.NetCore
                 foreach (var dict in types.OrderByDescending(x => x.Key))
                 {
                     //Console.WriteLine($"---------------dict: {dict.Key}");
-                    query = FilterQueryByCustomFilter(query, out bool finded, dict.Value, $"{dict.Key}.");
+                    query = FilterByCompanyColumnLegacy(query, out bool finded, dict.Value, $"{dict.Key}.");
                     if (finded) break;
                 }
             }
@@ -332,7 +399,7 @@ namespace SER.Graphql.Reflection.NetCore
             var whereArgs = new StringBuilder();
             var args = new List<object>();
             var orderBy = context.GetArgument<string>("orderBy");
-            var take = context.GetArgument<int?>("first");
+            var take = ClampTake(context.GetArgument<int?>("first"));
 
             string SqlConnectionStr = !string.IsNullOrEmpty(_optionsDelegate.CurrentValue.ConnectionString) ?
                 _optionsDelegate.CurrentValue.ConnectionString : !string.IsNullOrEmpty(_config.GetConnectionString("DefaultConnection")) ?
@@ -433,6 +500,15 @@ namespace SER.Graphql.Reflection.NetCore
         }
 
         private DbSet<T> GetModel(TContext dbContext) => dbContext.Set<T>();
+
+        // Caps a page size to SERGraphQlOptions.MaxPageSize (0 = uncapped). A caller asking for no page
+        // size (null) is left as-is; a caller asking for more than the cap is brought down to it.
+        private int? ClampTake(int? first)
+        {
+            var max = _optionsDelegate.CurrentValue.MaxPageSize;
+            if (max <= 0 || first == null) return first;
+            return first.Value > max ? max : first.Value;
+        }
 
         /// <summary>
         /// crea un instanica tipo T en la base de datos
@@ -557,26 +633,7 @@ namespace SER.Graphql.Reflection.NetCore
             var services = scope.ServiceProvider;
             var dbContext = services.GetRequiredService<TContext>();
 
-            T obj = null;
-            if (id is string)
-            {
-                if (Guid.TryParse(id.ToString(), out Guid @guid))
-                {
-                    var keyName = dbContext.Model.FindEntityType(typeof(T)).FindPrimaryKey()?.Properties
-                        .Select(x => x.Name).FirstOrDefault();
-                    var pi = typeof(T).GetProperty(keyName);
-                    var expToEvaluate = EqualPredicate<T>(typeof(T), keyName, @guid, pi.PropertyType);
-                    obj = GetModel(dbContext).FirstOrDefault(expToEvaluate);
-                }
-                else
-                {
-                    obj = GetModel(dbContext).Find(id);
-                }
-            }
-            else
-            {
-                obj = GetModel(dbContext).Find(id);
-            }
+            T obj = LoadForWrite(dbContext, id);
 
             if (obj != null)
             {
@@ -862,32 +919,39 @@ namespace SER.Graphql.Reflection.NetCore
             return Expression.Lambda<Func<M, bool>>(exp, parameter);
         }
 
+        // Loads the entity to be updated/deleted, scoped to the caller's tenant. For a merchant (company_id
+        // claim, non Super-User) the same tenant filter used on reads is applied, so a row belonging to
+        // another company resolves to null and the write is rejected as "not found" — closing the
+        // update/delete-by-primary-key cross-tenant path. Backoffice / Super-User callers load by PK as before.
+        private T LoadForWrite(TContext dbContext, object id)
+        {
+            var keyName = dbContext.Model.FindEntityType(typeof(T)).FindPrimaryKey()?.Properties
+                .Select(x => x.Name).FirstOrDefault();
+            if (keyName == null) return null;
+            var pi = typeof(T).GetProperty(keyName);
+
+            object key = id;
+            if (id is string s && Guid.TryParse(s, out var g)) key = g;
+
+            IQueryable<T> query = GetModel(dbContext).Where(EqualPredicate<T>(typeof(T), keyName, key, pi.PropertyType));
+
+            if (_optionsDelegate.CurrentValue.EnableCustomFilter
+                && !string.IsNullOrEmpty(GetCompanyIdUser())
+                && GetRolesUser().Any(x => x != "Super-User"))
+            {
+                query = FilterQueryByCustomFilter(query, out _);
+            }
+
+            return query.FirstOrDefault();
+        }
+
         public async Task<T> Delete(IResolveFieldContext context, object id, string alias = "", bool sendObjFirebase = true)
         {
             var scope = context.RequestServices.CreateScope();
             var services = scope.ServiceProvider;
             var dbContext = services.GetRequiredService<TContext>();
 
-            T obj = null;
-            if (id is string)
-            {
-                if (Guid.TryParse(id.ToString(), out Guid @guid))
-                {
-                    var keyName = dbContext.Model.FindEntityType(typeof(T)).FindPrimaryKey()?.Properties
-                        .Select(x => x.Name).FirstOrDefault();
-                    var pi = typeof(T).GetProperty(keyName);
-                    var expToEvaluate = EqualPredicate<T>(typeof(T), keyName, @guid, pi.PropertyType);
-                    obj = GetModel(dbContext).FirstOrDefault(expToEvaluate);
-                }
-                else
-                {
-                    obj = GetModel(dbContext).Find(id);
-                }
-            }
-            else
-            {
-                obj = GetModel(dbContext).Find(id);
-            }
+            T obj = LoadForWrite(dbContext, id);
 
             if (obj != null)
             {
