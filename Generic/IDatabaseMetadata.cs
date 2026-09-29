@@ -32,7 +32,6 @@ namespace SER.Graphql.Reflection.NetCore.Generic
         private IEnumerable<TableMetadata> _tables;
         private readonly IOptionsMonitor<SERGraphQlOptions> _optionsDelegate;
         private readonly IWebHostEnvironment _env;
-        private HashSet<string> _excluded = new HashSet<string>();
 
         // Inherited IdentityUser/IdentityRole members that must never be projected, even without an
         // attribute (the framework declares them, so they cannot carry [GraphQLIgnore]).
@@ -73,9 +72,6 @@ namespace SER.Graphql.Reflection.NetCore.Generic
         {
             var metaTables = new List<TableMetadata>();
 
-            // Fail closed: a configured-but-missing/invalid excluded-types file throws here, at startup.
-            _excluded = ExcludedGraphTypes.Load(_optionsDelegate.CurrentValue.ExcludedTypesPath);
-
             string SqlConnectionStr = !string.IsNullOrEmpty(_optionsDelegate.CurrentValue.ConnectionString) ?
                 _optionsDelegate.CurrentValue.ConnectionString : !string.IsNullOrEmpty(_config.GetConnectionString("DefaultConnection")) ?
                     _config.GetConnectionString("DefaultConnection") :
@@ -109,7 +105,7 @@ namespace SER.Graphql.Reflection.NetCore.Generic
                     // Console.WriteLine($"tabla evaluada Name {entityType.Name.Split(".").Last()} elementType {elementType}");
                 }
 
-                if (ExcludedGraphTypes.IsExcluded(elementType.Name, tableName))
+                if (elementType.IsDefined(typeof(GraphQLIgnoreAttribute), inherit: false))
                     continue;
 
                 var namePk = entityType.FindPrimaryKey()?.Properties
@@ -134,7 +130,7 @@ namespace SER.Graphql.Reflection.NetCore.Generic
             {
                 var tableName = entityType.Name;
 
-                if (ExcludedGraphTypes.IsExcluded(entityType.Name, tableName))
+                if (entityType.IsDefined(typeof(GraphQLIgnoreAttribute), inherit: false))
                     continue;
 
                 metaTables.Add(new TableMetadata
@@ -199,7 +195,7 @@ namespace SER.Graphql.Reflection.NetCore.Generic
                         && (typeof(Microsoft.AspNetCore.Identity.IdentityUser).IsAssignableFrom(type)
                             || typeof(Microsoft.AspNetCore.Identity.IdentityRole).IsAssignableFrom(type)))
                         continue;
-                    if (field != null && ExcludedGraphTypes.IsExcluded(field.Name, null))
+                    if (field != null && field.IsDefined(typeof(GraphQLIgnoreAttribute), inherit: false))
                         continue;
 
                     tableColumns.Add(new ColumnMetadata
